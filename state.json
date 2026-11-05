@@ -1,5 +1,7 @@
 {
-  "status": "closed",
-  "url": null,
-  "checked_at": "2026-11-05T12:38:17.490048+00:00"
+  "status": "unknown",
+  "last_successful_check": null,
+  "last_check_result": "not_started",
+  "last_registration_url": null,
+  "telegram_update_offset": 0
 }
