@@ -3,7 +3,7 @@ name: Karnataka Soura Mitra Monitor
 
 on:
   schedule:
-    - cron: "7 * * * *"
+    - cron: "17,32,47 * * * *"
 
   workflow_dispatch:
 
