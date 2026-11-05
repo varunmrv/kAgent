@@ -2,60 +2,35 @@
 import os
 import re
 import json
-from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
-
 import requests
-from playwright.sync_api import sync_playwright
+
+from datetime import datetime, timezone
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 BASE_URL = "https://souramitra.com/"
 STATE_FILE = "state.json"
 
-KEYWORDS = re.compile(
-    r"kusum|component[\s-]*b|farmer|registration|register|apply|solar.?pump",
-    re.I
-)
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 
-COMPONENT_B = re.compile(
-    r"component[\s-]*b|component b",
-    re.I
-)
-
-FARMER_REG = re.compile(
-    r"farmer|registration|register|apply",
-    re.I
-)
+API = f"https://api.telegram.org/bot{TOKEN}"
 
 
-def telegram_alert(url):
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
-
-    message = (
-        "🚨 PM-KUSUM KARNATAKA – COMPONENT B\n\n"
-        "A potentially active farmer registration form has been detected.\n\n"
-        f"Registration page: {url}\n"
-        f"Detected: {datetime.now(timezone.utc).isoformat()}\n\n"
-        "Please open the official page and verify availability."
-    )
-
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message},
-        timeout=20
-    )
-    response.raise_for_status()
-
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram notification failed")
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def load_state():
     try:
-        with open(STATE_FILE) as f:
+        with open(STATE_FILE, "r") as f:
             return json.load(f)
-    except FileNotFoundError:
-        return {"status": "unknown", "url": None}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            "status": "unknown",
+            "last_successful_check": None,
+            "last_registration_url": None,
+            "telegram_update_offset": 0
+        }
 
 
 def save_state(state):
@@ -63,159 +38,281 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def is_active_registration(page, link_context=""):
-    text = page.locator("body").inner_text(timeout=10000)
-
-    component_b = bool(
-        COMPONENT_B.search(text) or COMPONENT_B.search(link_context)
+def send_message(message):
+    response = requests.post(
+        f"{API}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True
+        },
+        timeout=20
     )
-    farmer_registration = bool(FARMER_REG.search(text))
+    response.raise_for_status()
 
-    if not (component_b and farmer_registration):
-        return False
+    result = response.json()
 
-    forms = page.locator("form")
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram error: {result}")
 
-    for i in range(forms.count()):
-        form = forms.nth(i)
 
-        if not form.is_visible():
+def get_updates(state):
+    offset = state.get("telegram_update_offset", 0)
+
+    response = requests.get(
+        f"{API}/getUpdates",
+        params={
+            "offset": offset,
+            "timeout": 0,
+            "allowed_updates": json.dumps(["message"])
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram polling error: {result}")
+
+    return result.get("result", [])
+
+
+def process_commands(state):
+    updates = get_updates(state)
+    force_check = False
+
+    for update in updates:
+        update_id = update["update_id"]
+        state["telegram_update_offset"] = update_id + 1
+
+        message = update.get("message", {})
+        chat = message.get("chat", {})
+
+        # Only accept commands from your configured Telegram chat.
+        if str(chat.get("id")) != CHAT_ID:
             continue
 
-        controls = form.locator(
-            "input:not([type=hidden]), select, textarea"
-        )
+        text = message.get("text", "").strip()
 
-        usable_controls = 0
-        for j in range(controls.count()):
-            control = controls.nth(j)
-            if control.is_visible() and control.is_enabled():
-                usable_controls += 1
+        if not text.startswith("/"):
+            continue
 
-        submit = form.locator(
-            'button[type="submit"], input[type="submit"]'
-        )
+        command = text.split()[0].split("@")[0].lower()
 
-        enabled_submit = False
-        for j in range(submit.count()):
-            item = submit.nth(j)
-            if item.is_visible() and item.is_enabled():
-                enabled_submit = True
+        if command == "/status":
+            last_check = state.get("last_successful_check")
+            status = state.get("status", "unknown")
 
-        if usable_controls >= 2 and enabled_submit:
-            return True
+            status_text = {
+                "open": "Registration entry point detected",
+                "closed": "Registration entry point not detected",
+                "unknown": "Status not established yet"
+            }.get(status, status)
 
-    return False
+            response = (
+                "📊 SOURA MITRA MONITOR STATUS\n\n"
+                "Monitor: GitHub Actions\n"
+                "Website: souramitra.com\n"
+                "Frequency: Every hour\n\n"
+                f"Last successful check: {last_check or 'Not checked yet'}\n"
+                f"Registration: {status_text}\n\n"
+                "Note: GitHub Actions runs periodically. "
+                "This status reflects the last completed check, "
+                "not a live connection."
+            )
+
+            send_message(response)
+
+        elif command == "/check":
+            force_check = True
+
+            send_message(
+                "🔎 CHECK REQUEST RECEIVED\n\n"
+                "Soura Mitra will be checked in this workflow run.\n"
+                "If this command arrives between scheduled runs, "
+                "it will be processed at the next hourly run."
+            )
+
+        elif command == "/help":
+            send_message(
+                "🤖 SOURA MITRA MONITOR COMMANDS\n\n"
+                "/status - View last monitoring status\n"
+                "/check - Request a website check\n"
+                "/help - Show available commands\n\n"
+                "Monitoring runs hourly through GitHub Actions."
+            )
+
+    return force_check
 
 
-def check_portal():
-    candidates = [(BASE_URL, "Karnataka PM-KUSUM portal")]
-    visited = set()
-    loaded = 0
+def first_visible(locator):
+    for i in range(locator.count()):
+        element = locator.nth(i)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        while candidates and len(visited) < 20:
-            url, context = candidates.pop(0)
-
-            if url in visited:
-                continue
-
-            visited.add(url)
-
-            try:
-                response = page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=45000
-                )
-
-                if response is None or response.status >= 400:
-                    continue
-
-                page.wait_for_timeout(2500)
-                loaded += 1
-
-                if is_active_registration(page, context):
-                    browser.close()
-                    return url
-
-                # Discover relevant links on the official site.
-                links = page.locator("a[href]")
-                for i in range(min(links.count(), 150)):
-                    link = links.nth(i)
-
-                    try:
-                        href = link.get_attribute("href")
-                        label = link.inner_text(timeout=1000)
-
-                        if not href:
-                            continue
-
-                        absolute = urljoin(url, href)
-                        parsed = urlparse(absolute)
-
-                        if parsed.scheme not in ("http", "https"):
-                            continue
-
-                        # Do not follow unrelated external websites.
-                        if parsed.netloc != "souramitra.com":
-                            continue
-
-                        context_text = f"{label} {context}"
-
-                        if KEYWORDS.search(
-                            context_text + " " + absolute
-                        ):
-                            if absolute not in visited:
-                                candidates.append(
-                                    (absolute, context_text)
-                                )
-                    except Exception:
-                        continue
-
-            except Exception as error:
-                print(f"Could not inspect {url}: {error}")
-
-        browser.close()
-
-    if loaded == 0:
-        raise RuntimeError(
-            "Could not access the portal. Keeping previous status."
-        )
+        try:
+            if element.is_visible():
+                return element
+        except Exception:
+            pass
 
     return None
 
 
+def check_souramitra():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        try:
+            response = page.goto(
+                BASE_URL,
+                wait_until="domcontentloaded",
+                timeout=60000
+            )
+
+            if response is None or response.status >= 400:
+                raise RuntimeError("Soura Mitra website returned an error")
+
+            try:
+                page.wait_for_load_state(
+                    "networkidle",
+                    timeout=10000
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            page.wait_for_timeout(2000)
+
+            continue_button = first_visible(
+                page.get_by_role(
+                    "button",
+                    name=re.compile(r"^\s*Continue\s*$", re.I)
+                )
+            )
+
+            if continue_button:
+                continue_button.click()
+                page.wait_for_timeout(2500)
+
+            body_text = page.locator("body").inner_text(timeout=15000)
+
+            expected_page = any(
+                phrase in body_text.lower()
+                for phrase in [
+                    "track application",
+                    "important documents",
+                    "public information"
+                ]
+            )
+
+            if not expected_page:
+                raise RuntimeError(
+                    "Could not verify the expected Soura Mitra homepage."
+                )
+
+            registration_item = first_visible(
+                page.get_by_text(
+                    re.compile(
+                        r"^\s*FARMER\s+REGISTRATION\s*$",
+                        re.I
+                    )
+                )
+            )
+
+            if not registration_item:
+                return None
+
+            print("Farmer Registration entry point found.")
+
+            registration_item.click()
+            page.wait_for_timeout(2500)
+
+            mobile_input = first_visible(
+                page.locator(
+                    'input[placeholder*="Mobile" i], input[type="tel"]'
+                )
+            )
+
+            otp_button = first_visible(
+                page.get_by_role(
+                    "button",
+                    name=re.compile(r"Send OTP", re.I)
+                )
+            )
+
+            submit_button = first_visible(
+                page.get_by_role(
+                    "button",
+                    name=re.compile(r"Submit Application", re.I)
+                )
+            )
+
+            if (
+                mobile_input and otp_button
+            ) or submit_button:
+                return page.url
+
+            raise RuntimeError(
+                "Registration entry point exists, but the expected "
+                "registration interface could not be verified."
+            )
+
+        finally:
+            browser.close()
+
+
 def main():
-    previous = load_state()
-    registration_url = check_portal()
+    state = load_state()
+
+    print("Starting Soura Mitra monitoring.")
+    print("Previous status:", state.get("status"))
+
+    # Process Telegram commands before checking the website.
+    process_commands(state)
+
+    # Every workflow run performs a website check.
+    registration_url = check_souramitra()
+
+    previous_status = state.get("status", "unknown")
+    checked_at = now()
 
     if registration_url:
-        print("Potential registration form detected:", registration_url)
 
-        if previous.get("status") != "open":
-            telegram_alert(registration_url)
-            print("Telegram alert sent.")
-        else:
-            print("Already alerted. No duplicate notification.")
+        if previous_status != "open":
+            send_message(
+                "🚨 SOURA MITRA – REGISTRATION DETECTED\n\n"
+                "Farmer Registration entry point is accessible.\n\n"
+                "The registration interface was detected, "
+                "but fresh application acceptance must be verified.\n\n"
+                f"Website: {BASE_URL}\n"
+                f"Detected page: {registration_url}\n"
+                f"Time: {checked_at}"
+            )
 
-        save_state({
-            "status": "open",
-            "url": registration_url,
-            "checked_at": datetime.now(timezone.utc).isoformat()
-        })
+        state["status"] = "open"
+        state["last_registration_url"] = registration_url
 
     else:
-        print("No active Component-B registration form detected.")
 
-        save_state({
-            "status": "closed",
-            "url": None,
-            "checked_at": datetime.now(timezone.utc).isoformat()
-        })
+        if previous_status == "open":
+            send_message(
+                "ℹ️ SOURA MITRA WEBSITE UPDATE\n\n"
+                "Farmer Registration entry point is no longer visible.\n"
+                "Monitoring continues."
+            )
+
+        state["status"] = "closed"
+        state["last_registration_url"] = None
+
+    state["last_successful_check"] = checked_at
+    state["last_check_result"] = "success"
+
+    save_state(state)
+
+    print("Monitoring completed successfully.")
+    print("Registration status:", state["status"])
+    print("Last successful check:", checked_at)
 
 
 if __name__ == "__main__":
