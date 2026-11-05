@@ -1,7 +1,7 @@
 {
-  "status": "unknown",
-  "last_successful_check": null,
-  "last_check_result": "not_started",
+  "status": "closed",
+  "last_successful_check": "2026-11-05T12:59:21+00:00",
+  "last_check_result": "success",
   "last_registration_url": null,
-  "telegram_update_offset": 0
+  "telegram_update_offset": 10654881
 }
