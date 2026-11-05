@@ -1,0 +1,31 @@
+
+name: Schedule Test - Every 5 Minutes
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/schedule-test.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+
+    steps:
+      - name: Confirm automatic execution
+        run: |
+          echo "================================"
+          echo "GITHUB SCHEDULE TEST"
+          echo "================================"
+          echo "Event: ${{ github.event_name }}"
+          echo "UTC time: $(date -u)"
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Workflow is working!"
