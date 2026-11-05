@@ -4,8 +4,9 @@ import re
 import json
 import requests
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
 
 BASE_URL = "https://souramitra.com/"
 STATE_FILE = "state.json"
@@ -104,22 +105,35 @@ def process_commands(state):
             last_check = state.get("last_successful_check")
             status = state.get("status", "unknown")
 
-            status_text = {
+            if last_check:
+                last_time = datetime.fromisoformat(last_check)
+                age = datetime.now(timezone.utc) - last_time
+
+                if age.total_seconds() < 2 * 60 * 60:
+                    health = "🟢 Recent successful monitoring run"
+                else:
+                    health = "🟠 STALE - Check GitHub Actions"
+
+                next_check = last_time + timedelta(hours=1)
+            else:
+                health = "⚪ Monitoring has not completed a check yet"
+                next_check = None
+
+            registration_text = {
                 "open": "Registration entry point detected",
                 "closed": "Registration entry point not detected",
-                "unknown": "Status not established yet"
-            }.get(status, status)
+                "unknown": "Not established yet"
+            }.get(registration, registration)
 
             response = (
                 "📊 SOURA MITRA MONITOR STATUS\n\n"
-                "Monitor: GitHub Actions\n"
+                f"Monitor health: {health}\n"
                 "Website: souramitra.com\n"
                 "Frequency: Every hour\n\n"
                 f"Last successful check: {last_check or 'Not checked yet'}\n"
-                f"Registration: {status_text}\n\n"
-                "Note: GitHub Actions runs periodically. "
-                "This status reflects the last completed check, "
-                "not a live connection."
+                f"Next expected check: {next_check.isoformat() if next_check else 'Unknown'}\n"
+                f"Registration: {registration_text}\n\n"
+                "Note: This is based on the last saved successful run."
             )
 
             send_message(response)
