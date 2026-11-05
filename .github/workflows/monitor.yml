@@ -95,9 +95,3 @@ jobs:
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=🔴 SOURA MITRA MONITOR ERROR
 
-The GitHub Actions monitoring run failed.
-
-Please check:
-https://github.com/${GITHUB_REPOSITORY}/actions
-
-The next scheduled run may retry automatically."
