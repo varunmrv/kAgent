@@ -1,6 +1,6 @@
 # kAgent - Soura Mitra registration monitor
 
-Watches https://souramitra.com/ and sends a Telegram alert when the **Farmer Registration**
+Watches the website set in the `SITE_URL` secret and sends a Telegram alert when the **Farmer Registration**
 entry point appears or disappears. `/status`, `/check` and `/help` are answered within seconds.
 
 ## How it runs on GitHub Actions only
@@ -26,7 +26,9 @@ monitor.yml  (one long job, ~5.5 h)                    watchdog.yml (cron every 
 
 ## Setup
 
-1. Repo **Settings > Secrets and variables > Actions**: add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+1. Repo **Settings > Secrets and variables > Actions > Secrets**: add `TELEGRAM_BOT_TOKEN`,
+   `TELEGRAM_CHAT_ID` and `SITE_URL` (full URL, e.g. `https://example.com/`).
+   The monitor refuses to start and names the missing one if any is unset.
 2. **Settings > Actions > General**: *Workflow permissions* = read and write; for forks set
    *Require approval for all outside collaborators*.
 3. Start it once: **Actions > kAgent Monitor > Run workflow** (or `gh workflow run monitor.yml`).
@@ -38,7 +40,7 @@ To stop it: disable the **kAgent Watchdog** workflow, then cancel the running **
 
 ```bash
 pip install -r requirements.txt && python -m playwright install chromium
-export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=...
+export TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... SITE_URL=https://example.com/
 python monitor.py --once      # one poll + one check
 python monitor.py             # loop until RUN_SECONDS (default 19800)
 ```
@@ -48,7 +50,9 @@ Settings (env vars): `CHECK_INTERVAL_SECONDS` (300), `RUN_SECONDS` (19800),
 
 ## Security notes (public repo)
 
-- The token and chat id exist only as GitHub Secrets. No workflow uses `pull_request` triggers,
+- The token, chat id and site URL exist only as GitHub Secrets (GitHub masks them in logs, and
+  `monitor.py` also redacts all three from every log line and error). `state.json` never stores the URL.
+- The `state` branch is public too: it contains only status, timestamps and the Telegram offset. No workflow uses `pull_request` triggers,
   so fork PRs cannot reach them.
 - `monitor.py` redacts the bot token from every log line and error message.
 - `state.json`, `.env` and `__pycache__` are git-ignored. `state.json` holds no secrets

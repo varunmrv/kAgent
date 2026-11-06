@@ -8,7 +8,9 @@ Two modes:
                              (or SIGINT/SIGTERM arrives), then saves state and exits 0.
   python monitor.py --once   One poll + one check, then exit (handy for local tests).
 
-Secrets come only from the environment: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+Secrets come only from the environment (GitHub Actions secrets):
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SITE_URL (the website to watch, e.g. https://example.com/).
+Nothing sensitive is hard-coded, and none of the three values is ever logged or saved to state.
 """
 
 import argparse
@@ -20,9 +22,12 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+from urllib.parse import urlparse
+
 import requests
 
-BASE_URL = "https://souramitra.com/"
+BASE_URL = os.environ.get("SITE_URL", "").strip()   # secret: never hard-code or log it
+SITE_HOST = urlparse(BASE_URL).hostname or ""
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -50,12 +55,12 @@ DEFAULT_STATE = {
     "last_check_result": None,
     "last_error": None,
     "consecutive_failures": 0,
-    "last_registration_url": None,
     "telegram_update_offset": 0,
 }
 
-# In-memory info shown by /status
-RUNTIME = {"started_at": None, "ends_at": None, "next_check": None}
+# In-memory info shown by /status. The detected page URL lives here only: state.json is
+# published on the public "state" branch, so it must not contain the site address.
+RUNTIME = {"started_at": None, "ends_at": None, "next_check": None, "registration_url": None}
 
 
 class Stop(BaseException):
@@ -75,8 +80,9 @@ def now():
 def redact(text):
     """Never let the bot token reach logs or Telegram (this repo's logs are public)."""
     text = str(text)
-    if TOKEN:
-        text = text.replace(TOKEN, "***")
+    for secret in (TOKEN, CHAT_ID, BASE_URL.rstrip("/"), SITE_HOST):
+        if secret:
+            text = text.replace(secret, "***")
     return re.sub(r"bot\d{6,}:[A-Za-z0-9_-]{20,}", "bot***", text)
 
 
@@ -92,6 +98,7 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             loaded = json.load(f)
         if isinstance(loaded, dict):
+            loaded.pop("last_registration_url", None)  # legacy key: never persist the URL
             state.update(loaded)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -172,7 +179,7 @@ def build_status(state):
     return (
         "📊 SOURA MITRA MONITOR STATUS\n\n"
         f"Monitor health: {health}\n"
-        f"Website: souramitra.com\n"
+        f"Website: {BASE_URL}\n"
         f"Frequency: every {CHECK_INTERVAL // 60} min\n\n"
         f"Last successful check: {last or 'Not checked yet'}\n"
         f"Next check: {nxt.isoformat(timespec='seconds') if nxt else 'Unknown'}\n"
@@ -354,7 +361,7 @@ def apply_check(state, check=None):
         log("alert failed:", e)
 
     state["status"] = "open" if url else "closed"
-    state["last_registration_url"] = url
+    RUNTIME["registration_url"] = url
     state["last_successful_check"] = checked_at
     state["last_check_result"] = "success"
     state["last_error"] = None
@@ -379,8 +386,14 @@ def main(argv=None):
     parser.add_argument("--once", action="store_true", help="one poll + one check, then exit")
     args = parser.parse_args(argv)
 
-    if not TOKEN or not CHAT_ID:
-        print("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.", file=sys.stderr)
+    missing = [n for n, v in (("TELEGRAM_BOT_TOKEN", TOKEN), ("TELEGRAM_CHAT_ID", CHAT_ID),
+                              ("SITE_URL", BASE_URL)) if not v]
+    if missing:
+        print("Missing required secret(s): " + ", ".join(missing)
+              + ". Add them under Settings > Secrets and variables > Actions.", file=sys.stderr)
+        return 2
+    if urlparse(BASE_URL).scheme not in ("http", "https") or not SITE_HOST:
+        print("SITE_URL must be a full http(s) URL, e.g. https://example.com/", file=sys.stderr)
         return 2
 
     install_signal_handlers()
