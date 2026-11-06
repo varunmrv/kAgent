@@ -41,9 +41,13 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        timeout-minutes: 8
         run: |
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          # No --with-deps: the ubuntu-24.04 runner already has Chromium's system
+          # libraries, and the apt step only pulled optional fonts from a mirror
+          # that can stall for minutes.
+          python -m playwright install chromium
 
       - name: Restore state
         run: bash scripts/state_branch.sh pull
