@@ -1,0 +1,13 @@
+# runtime state lives on the "state" branch, never on main
+state.json
+state.json.tmp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# secrets - these must only ever be GitHub Secrets
+.env
+.env.*
+*.pem

@@ -1,0 +1,29 @@
+name: kAgent Watchdog
+
+# Safety net. GitHub may delay or drop scheduled runs, so this does NOT do the
+# monitoring: it only checks that a monitor run is active or queued and starts one
+# if not. It finishes in a few seconds, so dropped runs of it cost nothing.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: kagent-watchdog
+  cancel-in-progress: true
+
+jobs:
+  ensure-monitor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start monitor if none is running
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: bash scripts/ensure_monitor.sh watchdog

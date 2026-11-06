@@ -1,97 +1,80 @@
+name: kAgent Monitor
 
-name: Karnataka Soura Mitra Monitor
-
+# One long job (~5.5 h) that polls Telegram continuously and checks the website every
+# 5 minutes. Before the 6 h GitHub limit it exits cleanly, saves state and starts the
+# next run of itself. The watchdog workflow restarts the chain if that ever breaks.
 on:
-  schedule:
-    - cron: "17,32,47 * * * *"
-
   workflow_dispatch:
 
+# Only the workflow itself can use the secrets: there are no pull_request triggers,
+# and secrets are never exposed to forks.
 permissions:
-  contents: write
+  contents: write   # push the "state" branch
+  actions: write    # start the next run
 
+# Never two monitors at once. A newly dispatched run waits (it is not cancelled)
+# until the current one finishes, so there is no gap and no double polling.
 concurrency:
-  group: souramitra-monitor
+  group: kagent-monitor
   cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 350   # RUN_SECONDS (5.5 h) + setup + hand-over, below the 6 h cap
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      RUN_SECONDS: "19800"           # 5 h 30 min of monitoring per run
+      CHECK_INTERVAL_SECONDS: "300"  # website check every 5 minutes
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Notify monitoring started
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Restore state
+        run: bash scripts/state_branch.sh pull
+
+      - name: Run monitor
         run: |
-          python - <<'PY'
-          import os
-          import requests
+          # Save state to the "state" branch every 20 minutes, so a crash or a
+          # cancelled run loses at most 20 minutes of bookkeeping.
+          ( while sleep 1200; do bash scripts/state_branch.sh push || true; done ) &
+          saver=$!
+          trap 'kill "$saver" 2>/dev/null || true' EXIT
+          python -u monitor.py
 
-          response = requests.post(
-              f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
-              json={
-                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                  "text": (
-                      "🟢 SOURA MITRA MONITOR STARTED\n\n"
-                      "Website: https://souramitra.com/\n"
-                      "Monitoring: Farmer Registration\n"
-                      "Frequency: Every hour\n"
-                      "Commands: /status, /check, /help"
-                  )
-              },
-              timeout=20
-          )
-
-          response.raise_for_status()
-
-          if not response.json().get("ok"):
-              raise RuntimeError("Telegram notification failed")
-          PY
-
-      - name: Run website monitor
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python monitor.py
-
-      - name: Save monitoring state
+      - name: Save state
         if: always()
-        run: |
-          git config user.name "KUSUM Monitor"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+        run: bash scripts/state_branch.sh push
 
-          git add state.json
+      # Hand-over: start the next run (it queues until this one ends).
+      # Skipped when someone cancelled the run on purpose, and after a failure the
+      # watchdog restarts things within 10 minutes (avoids a tight crash loop).
+      - name: Start next run
+        if: success()
+        run: bash scripts/ensure_monitor.sh handover
 
-          git diff --cached --quiet || (
-            git commit -m "Update Soura Mitra monitoring state"
-            git push
-          )
-
-      - name: Notify Telegram about workflow failure
+      - name: Alert on failure
         if: failure()
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -fsS --max-time 20 \
-            -X POST \
+          curl -fsS --max-time 20 -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text=🔴 SOURA MITRA MONITOR ERROR
-
+            --data-urlencode "text=🔴 kAgent monitor run FAILED. The watchdog will restart it within ~10 minutes.
+          ${RUN_URL}" >/dev/null || echo "could not send failure alert"
