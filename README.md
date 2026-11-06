@@ -1,7 +1,17 @@
 # kAgent - Soura Mitra registration monitor
 
 Watches the website set in the `SITE_URL` secret and sends a Telegram alert when the **Farmer Registration**
-entry point appears or disappears. `/status`, `/check` and `/help` are answered within seconds.
+entry point appears or disappears. Commands are answered within seconds:
+
+| Command | What it does |
+|---|---|
+| `/status` | Health, last and next check, registration state |
+| `/check` | Check the website right now and report |
+| `/screenshot` | Send a picture of the site's home page |
+| `/ack` | Stop repeat alerts (and unpin) after registration opens |
+| `/help` | List commands |
+
+All times in messages are shown in **IST** (state files stay in UTC).
 
 ## How it runs on GitHub Actions only
 
@@ -23,6 +33,26 @@ monitor.yml  (one long job, ~5.5 h)                    watchdog.yml (cron every 
   `state` branch, saved every 20 minutes and at exit, so `main` has no bot commits.
 - **Alerts:** registration detected / gone, 3 failed checks in a row, recovery, monitor gap,
   and a failed workflow run.
+
+## The "registration open" alert
+
+- Bold headline plus a mention of you (a tappable `tg://user?id=` link in a private chat, or
+  `@username` if you set it), the screenshot of the registration page, and the alert is **pinned**.
+- It **repeats every 10 min (up to 12 times) until you send `/ack`**. Telegram bots cannot make a
+  message louder; repeats plus the pin are the reliable way not to miss it. For a custom sound, set it in
+  the chat's notification settings.
+- Page and error text is HTML-escaped. If Telegram rejects the markup the alert is resent as plain
+  text, and if the screenshot cannot be sent the text alert still goes out.
+- Failure alerts carry a screenshot of the page as it looked when the check failed.
+- Screenshots are kept in memory and sent straight to your chat. They are never saved, logged, uploaded
+  as artifacts or committed (this repo is public).
+
+### Kannada text in screenshots
+
+macOS already has Kannada fonts. A fresh GitHub runner has none, so Chromium would draw empty boxes.
+`fonts/` bundles **Noto Sans Kannada** (SIL Open Font License, see `fonts/OFL.txt`) and `monitor.py`
+registers it with fontconfig before launching the browser. No `apt` step is needed (that step hung earlier).
+Screenshots are 1280x960 at 1.5x scale, and the page waits for web fonts before capture.
 
 ## Setup
 
@@ -46,7 +76,10 @@ python monitor.py             # loop until RUN_SECONDS (default 19800)
 ```
 
 Settings (env vars): `CHECK_INTERVAL_SECONDS` (300), `RUN_SECONDS` (19800),
-`POLL_TIMEOUT_SECONDS` (25), `GAP_ALERT_SECONDS` (1200).
+`POLL_TIMEOUT_SECONDS` (25), `GAP_ALERT_SECONDS` (1200), `REPEAT_SECONDS` (600), `MAX_REPEATS` (12).
+
+Optional repository **Variables** (not secrets): `MENTION_NAME` (name used in the mention, default your
+Telegram first name) and `MENTION_USERNAME` (use `@username` instead, handy in a group chat).
 
 ## Security notes (public repo)
 

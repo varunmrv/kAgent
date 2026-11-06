@@ -14,10 +14,13 @@ Nothing sensitive is hard-coded, and none of the three values is ever logged or 
 """
 
 import argparse
+import html
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -48,6 +51,22 @@ POLL_TIMEOUT = env_int("POLL_TIMEOUT_SECONDS", 25)        # Telegram long-poll l
 GAP_ALERT_SECONDS = env_int("GAP_ALERT_SECONDS", 1200)    # "monitor was down" notice
 FAILURE_ALERT_AFTER = 3                                   # consecutive failed checks
 MAX_POLL_ERRORS = 30                                      # then exit non-zero
+REPEAT_SECONDS = env_int("REPEAT_SECONDS", 600)           # re-alert while registration is open...
+MAX_REPEATS = env_int("MAX_REPEATS", 12)                  # ...until /ack, at most this many alerts
+
+# Optional personalisation of the "registration open" alert (never required).
+MENTION_NAME = os.environ.get("MENTION_NAME", "").strip()          # name shown in the mention
+MENTION_USERNAME = os.environ.get("MENTION_USERNAME", "").strip().lstrip("@")  # for group chats
+
+IST = timezone(timedelta(hours=5, minutes=30))            # India has no daylight saving
+
+# Screenshot settings. Same width as Playwright's default, so the page layout (and the
+# selectors in check_souramitra) behave exactly as before; scale 1.5 keeps text crisp.
+VIEWPORT = {"width": 1280, "height": 960}
+DEVICE_SCALE = 1.5
+MAX_PHOTO_BYTES = 9_000_000      # Telegram photo limit is 10 MB
+CAPTION_LIMIT = 1000             # Telegram caption limit is 1024 characters
+BLANK_PNG_BYTES = 15_000         # a 1280x960 page with real content is far larger than this
 
 DEFAULT_STATE = {
     "status": "unknown",
@@ -56,11 +75,17 @@ DEFAULT_STATE = {
     "last_error": None,
     "consecutive_failures": 0,
     "telegram_update_offset": 0,
+    # "registration open" alert bookkeeping (times only, nothing sensitive)
+    "alert_acked": False,
+    "alert_count": 0,
+    "last_alert_at": None,
+    "pinned_message_id": None,
 }
 
 # In-memory info shown by /status. The detected page URL lives here only: state.json is
 # published on the public "state" branch, so it must not contain the site address.
-RUNTIME = {"started_at": None, "ends_at": None, "next_check": None, "registration_url": None}
+RUNTIME = {"started_at": None, "ends_at": None, "next_check": None, "registration_url": None,
+           "screenshot": None, "error_screenshot": None, "user_name": None}   # PNG bytes, memory only
 
 
 class Stop(BaseException):
@@ -75,6 +100,34 @@ def now_dt():
 
 def now():
     return now_dt().isoformat(timespec="seconds")
+
+
+def fmt_ist(value):
+    """Human-readable IST time, e.g. '6 Nov 2026, 6:42 PM IST'. Accepts datetime or ISO text.
+    State files stay in UTC; only what the user reads is converted."""
+    if not value:
+        return "n/a"
+    dt = datetime.fromisoformat(value) if isinstance(value, str) else value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(IST)
+    return f"{dt.day} {dt:%b %Y}, {dt.hour % 12 or 12}:{dt:%M} {'AM' if dt.hour < 12 else 'PM'} IST"
+
+
+def esc(text):
+    """Escape page/error text before putting it in an HTML-formatted Telegram message."""
+    return html.escape(str(text), quote=False)
+
+
+def mention():
+    """Highlighted name for the open-registration alert. In a private chat the chat id is
+    the user id, so tg://user?id=... renders a tappable mention (and notifies in groups)."""
+    if re.fullmatch(r"\w{4,32}", MENTION_USERNAME):
+        return f"@{MENTION_USERNAME}"
+    name = esc(MENTION_NAME or RUNTIME.get("user_name") or "Farmer")
+    if CHAT_ID.isdigit():          # positive id = a private chat with the user
+        return f'<a href="tg://user?id={CHAT_ID}">{name}</a>'
+    return f"<b>{name}</b>"
 
 
 def redact(text):
@@ -142,8 +195,67 @@ def tg(method, payload=None, timeout=20, retries=3):
     raise last
 
 
-def send_message(text):
-    tg("sendMessage", {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True})
+def strip_tags(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def send_message(text, silent=False):
+    """Send an HTML-formatted message (callers escape dynamic text with esc()).
+    If Telegram still rejects the markup, resend as plain text so an alert is never lost.
+    Returns the message_id."""
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": True, "disable_notification": silent}
+    try:
+        return (tg("sendMessage", payload) or {}).get("message_id")
+    except RuntimeError as e:
+        if "parse entities" not in str(e):
+            raise
+        payload.pop("parse_mode")
+        payload["text"] = strip_tags(text)
+        return (tg("sendMessage", payload) or {}).get("message_id")
+
+
+def send_photo(image, caption, silent=False):
+    """Send a PNG with an HTML caption. Falls back to a text message if the upload fails
+    (too big, network, bad markup), so the alert text always arrives. Returns message_id."""
+    caption = caption if len(caption) <= CAPTION_LIMIT else caption[:CAPTION_LIMIT - 1] + "…"
+    if not image or len(image) > MAX_PHOTO_BYTES:
+        return send_message(caption, silent)
+    try:
+        r = requests.post(
+            f"{API}/sendPhoto",
+            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML",
+                  "disable_notification": str(bool(silent)).lower()},
+            files={"photo": ("page.png", image, "image/png")},
+            timeout=60,
+        )
+        data = r.json() if r.content else {}
+        if r.ok and data.get("ok"):
+            return (data.get("result") or {}).get("message_id")
+        log("sendPhoto failed: HTTP", r.status_code, data.get("description", ""))
+    except requests.RequestException as e:
+        log("sendPhoto network error:", type(e).__name__)
+    return send_message(caption, silent)
+
+
+def pin_message(message_id, silent=True):
+    """Pin the alert at the top of the chat (best effort; needs no extra rights in a private chat)."""
+    if not message_id:
+        return
+    try:
+        tg("pinChatMessage", {"chat_id": CHAT_ID, "message_id": message_id,
+                              "disable_notification": silent}, retries=1)
+    except Exception as e:  # noqa: BLE001
+        log("pin failed:", e)
+
+
+def unpin_message(message_id):
+    if not message_id:
+        return
+    try:
+        tg("unpinChatMessage", {"chat_id": CHAT_ID, "message_id": message_id}, retries=1)
+    except Exception as e:  # noqa: BLE001
+        log("unpin failed:", e)
 
 
 # --------------------------------------------------------------------------- commands
@@ -155,11 +267,14 @@ REGISTRATION_TEXT = {
 }
 
 HELP_TEXT = (
-    "🤖 kAgent - SOURA MITRA MONITOR\n\n"
+    "🤖 <b>kAgent - SOURA MITRA MONITOR</b>\n\n"
     "/status - Monitor health and last result\n"
     "/check - Check the website right now\n"
+    "/screenshot - Send a picture of the website's home page\n"
+    "/ack - Stop repeat alerts after registration opens\n"
     "/help - Show this list\n\n"
-    f"The monitor checks every {CHECK_INTERVAL // 60} min and answers commands within seconds."
+    f"The monitor checks every {CHECK_INTERVAL // 60} min and answers commands within seconds. "
+    "All times are in IST."
 )
 
 
@@ -176,16 +291,17 @@ def build_status(state):
         health = "⚪ No successful check yet"
     nxt = RUNTIME.get("next_check")
     ends = RUNTIME.get("ends_at")
+    icon = {"open": "✅", "closed": "❌"}.get(status, "❔")
     return (
-        "📊 SOURA MITRA MONITOR STATUS\n\n"
+        "📊 <b>SOURA MITRA MONITOR STATUS</b>\n\n"
         f"Monitor health: {health}\n"
-        f"Website: {BASE_URL}\n"
+        f"Website: {esc(BASE_URL)}\n"
         f"Frequency: every {CHECK_INTERVAL // 60} min\n\n"
-        f"Last successful check: {last or 'Not checked yet'}\n"
-        f"Next check: {nxt.isoformat(timespec='seconds') if nxt else 'Unknown'}\n"
-        f"Registration: {REGISTRATION_TEXT.get(status, status)}\n"
+        f"Last successful check: {fmt_ist(last) if last else 'Not checked yet'}\n"
+        f"Next check: {fmt_ist(nxt) if nxt else 'Unknown'}\n"
+        f"Registration: {icon} {esc(REGISTRATION_TEXT.get(status, status))}\n"
         f"Consecutive failures: {state.get('consecutive_failures', 0)}\n"
-        f"This run ends (then auto-restarts): {ends.isoformat(timespec='seconds') if ends else 'n/a'}"
+        f"This run ends (then auto-restarts): {fmt_ist(ends) if ends else 'n/a'}"
     )
 
 
@@ -207,6 +323,7 @@ def handle_update(update, state):
     message = update.get("message") or {}
     if str((message.get("chat") or {}).get("id")) != CHAT_ID:
         return False  # ignore anyone else
+    RUNTIME["user_name"] = (message.get("from") or {}).get("first_name") or RUNTIME.get("user_name")
     text = (message.get("text") or "").strip()
     if not text.startswith("/"):
         return False
@@ -216,9 +333,36 @@ def handle_update(update, state):
     elif command == "/check":
         send_message("🔎 Checking Soura Mitra now...")
         return True
+    elif command == "/screenshot":
+        handle_screenshot()
+    elif command == "/ack":
+        handle_ack(state)
     elif command in ("/help", "/start"):
         send_message(HELP_TEXT)
     return False
+
+
+def handle_screenshot():
+    """/screenshot: live picture of the home page. If it fails, say why in text."""
+    send_message("📸 Taking a screenshot of the website...", silent=True)
+    try:
+        png = take_screenshot()
+    except Exception as e:  # noqa: BLE001
+        log("screenshot command failed:", e)
+        send_message(f"⚠️ Could not take a screenshot: {esc(redact(e))[:300]}")
+        return
+    send_photo(png, f"📸 <b>Soura Mitra home page</b>\n🕒 {fmt_ist(now_dt())}")
+
+
+def handle_ack(state):
+    if state.get("status") == "open" and not state.get("alert_acked"):
+        state["alert_acked"] = True
+        unpin_message(state.get("pinned_message_id"))
+        state["pinned_message_id"] = None
+        save_state(state)
+        send_message("👍 Acknowledged. Repeat alerts stopped; monitoring continues.")
+    else:
+        send_message("Nothing to acknowledge right now.")
 
 
 def process_updates(state, timeout):
@@ -248,30 +392,117 @@ def first_visible(locator):
     return None
 
 
-def check_souramitra():
-    """Return the registration page URL if registration looks open, None if the entry
-    point is not shown. Raises if the site/layout cannot be verified."""
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
+
+def ensure_fonts():
+    """Make Kannada (and other Indic) text render in screenshots.
+
+    macOS ships Kannada fonts. A fresh Linux runner does not, so Chromium would draw empty
+    boxes. We bundle Noto Sans Kannada (SIL OFL) in fonts/ and register it for fontconfig
+    under ~/.local/share/fonts. Idempotent, no apt/network, never raises."""
+    if sys.platform == "darwin":
+        return True
+    try:
+        dest = os.path.expanduser("~/.local/share/fonts/kagent")
+        os.makedirs(dest, exist_ok=True)
+        copied = False
+        for name in os.listdir(FONT_DIR) if os.path.isdir(FONT_DIR) else []:
+            if name.endswith(".ttf") and not os.path.exists(os.path.join(dest, name)):
+                shutil.copy(os.path.join(FONT_DIR, name), dest)
+                copied = True
+        if copied and shutil.which("fc-cache"):
+            subprocess.run(["fc-cache", "-f", dest], timeout=60, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if shutil.which("fc-list"):
+            out = subprocess.run(["fc-list", ":lang=kn", "family"], capture_output=True,
+                                 text=True, timeout=30).stdout
+            if not out.strip():
+                log("WARNING: no Kannada font found; screenshots may show boxes for Kannada text.")
+                return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        log("font setup failed:", e)
+        return False
+
+
+def snap(page):
+    """PNG of the current viewport, or None. Never raises: a screenshot problem must not
+    break the check. Waits for web fonts first, and retries once if the page looks blank
+    (a blank page compresses to a tiny PNG)."""
+    for attempt in range(2):
+        try:
+            page.evaluate("document.fonts ? document.fonts.ready.then(() => true) : true")
+            page.wait_for_timeout(500)
+            png = page.screenshot(type="png", full_page=False, timeout=20000)
+            if len(png) >= BLANK_PNG_BYTES or attempt == 1:
+                if len(png) < BLANK_PNG_BYTES:
+                    log("screenshot looks blank; sending it anyway")
+                return png
+            page.wait_for_timeout(2500)   # looked blank: give the page more time
+        except Exception as e:  # noqa: BLE001
+            log("screenshot failed:", e)
+            return None
+    return None
+
+
+def new_page(browser):
+    context = browser.new_context(viewport=VIEWPORT, device_scale_factor=DEVICE_SCALE,
+                                  locale="en-IN", timezone_id="Asia/Kolkata")
+    return context.new_page()
+
+
+def open_home(page):
+    """Load the home page and click the optional 'Continue' gate. Raises on HTTP errors."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    response = page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    if response is None or response.status >= 400:
+        raise RuntimeError("Soura Mitra website returned an error")
+    try:
+        page.wait_for_load_state("networkidle", timeout=10000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(2000)
+    cont = first_visible(page.get_by_role("button", name=re.compile(r"^\s*Continue\s*$", re.I)))
+    if cont:
+        cont.click()
+        page.wait_for_timeout(2500)
+
+
+def take_screenshot():
+    """Fresh browser, home page, PNG bytes (used by /screenshot). Raises if it can't load."""
+    from playwright.sync_api import sync_playwright
+
+    ensure_fonts()   # before launch: Chromium reads the font list at startup
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
         try:
-            response = page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-            if response is None or response.status >= 400:
-                raise RuntimeError("Soura Mitra website returned an error")
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except PWTimeout:
-                pass
-            page.wait_for_timeout(2000)
+            page = new_page(browser)
+            open_home(page)
+            png = snap(page)
+            if not png:
+                raise RuntimeError("could not capture a screenshot")
+            return png
+        finally:
+            browser.close()
 
-            cont = first_visible(
-                page.get_by_role("button", name=re.compile(r"^\s*Continue\s*$", re.I))
-            )
-            if cont:
-                cont.click()
-                page.wait_for_timeout(2500)
+
+def check_souramitra():
+    """Return the registration page URL if registration looks open, None if the entry
+    point is not shown. Raises if the site/layout cannot be verified.
+    Side effect: RUNTIME['screenshot'] holds a PNG of the page that decided the result
+    (registration page when open, home page when closed); RUNTIME['error_screenshot']
+    holds the page as it looked when a check failed. The page stays open until captured."""
+    from playwright.sync_api import sync_playwright
+
+    RUNTIME["screenshot"] = RUNTIME["error_screenshot"] = None
+    ensure_fonts()   # before launch: Chromium reads the font list at startup
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = new_page(browser)
+        try:
+            open_home(page)
 
             body = page.locator("body").inner_text(timeout=15000).lower()
             if not any(k in body for k in ("track application", "important documents", "public information")):
@@ -281,6 +512,7 @@ def check_souramitra():
                 page.get_by_text(re.compile(r"^\s*FARMER\s+REGISTRATION\s*$", re.I))
             )
             if not item:
+                RUNTIME["screenshot"] = snap(page)   # closed: show the home page we saw
                 return None
 
             log("Farmer Registration entry point found.")
@@ -295,10 +527,15 @@ def check_souramitra():
                 page.get_by_role("button", name=re.compile(r"Submit Application", re.I))
             )
             if (mobile and otp) or submit:
+                RUNTIME["screenshot"] = snap(page)   # captured BEFORE the browser closes
                 return page.url
             raise RuntimeError(
                 "Registration entry point exists, but the registration interface could not be verified."
             )
+        except Exception:
+            # Keep what the page looked like when the check failed (layout change vs outage).
+            RUNTIME["error_screenshot"] = snap(page)
+            raise
         finally:
             browser.close()
 
@@ -317,11 +554,36 @@ def run_check_with_retry(attempts=2):
 
 # --------------------------------------------------------------------------- one check cycle
 
+def send_open_alert(state, url, repeat=False):
+    """The loud alert: bold headline, a mention of the user, the page screenshot, a pin.
+    Repeats (until /ack) are marked as reminders and are not re-pinned."""
+    count = state.get("alert_count", 0) + 1 if repeat else 1   # a fresh opening restarts the count
+    headline = "🚨🚨 <b>REGISTRATION OPEN - SOURA MITRA</b> 🚨🚨"
+    if repeat:
+        headline = f"🔁 <b>REMINDER {count}/{MAX_REPEATS}: REGISTRATION STILL OPEN</b>"
+    caption = (
+        f"{headline}\n\n{mention()}, Farmer Registration is now accessible.\n"
+        "The registration form was detected. Please verify that new applications "
+        "are being accepted.\n\n"
+        f"🕒 Detected: {fmt_ist(now_dt())}\n"
+        f"🔗 Page: {esc(url)}\n"
+        "Reply /ack to stop reminders."
+    )
+    message_id = send_photo(RUNTIME.get("screenshot"), caption)
+    state["alert_count"] = count
+    state["last_alert_at"] = now()
+    if not repeat:
+        state["alert_acked"] = False
+        state["pinned_message_id"] = message_id
+        pin_message(message_id)
+
+
 def apply_check(state, check=None):
     """Run one website check and update state / send alerts. Never raises."""
     check = check or run_check_with_retry
     previous = state.get("status", "unknown")
     checked_at = now()
+    RUNTIME["screenshot"] = RUNTIME["error_screenshot"] = None
     try:
         url = check()
     except Exception as e:  # noqa: BLE001
@@ -331,9 +593,11 @@ def apply_check(state, check=None):
         log("check failed:", e)
         if state["consecutive_failures"] == FAILURE_ALERT_AFTER:
             try:
-                send_message(
-                    "🔴 SOURA MITRA MONITOR: website check keeps failing "
-                    f"({FAILURE_ALERT_AFTER} times in a row).\nLast error: {state['last_error']}"
+                send_photo(
+                    RUNTIME.get("error_screenshot"),
+                    "🔴 <b>SOURA MITRA MONITOR: website check keeps failing</b> "
+                    f"({FAILURE_ALERT_AFTER} times in a row).\n"
+                    f"🕒 {fmt_ist(now_dt())}\nLast error: {esc(state['last_error'])}",
                 )
             except Exception as ne:  # noqa: BLE001
                 log("alert failed:", ne)
@@ -343,20 +607,23 @@ def apply_check(state, check=None):
     recovered = state.get("consecutive_failures", 0) >= FAILURE_ALERT_AFTER
     try:
         if url and previous != "open":
-            send_message(
-                "🚨 SOURA MITRA - REGISTRATION DETECTED\n\n"
-                "Farmer Registration entry point is accessible.\n"
-                "The registration interface was detected, but fresh application "
-                "acceptance must be verified.\n\n"
-                f"Website: {BASE_URL}\nDetected page: {url}\nTime: {checked_at}"
-            )
+            send_open_alert(state, url)
+        elif url and not state.get("alert_acked"):
+            due = state.get("last_alert_at")
+            waited = (now_dt() - datetime.fromisoformat(due)).total_seconds() if due else 1e9
+            if waited >= REPEAT_SECONDS and state.get("alert_count", 0) < MAX_REPEATS:
+                send_open_alert(state, url, repeat=True)
         elif not url and previous == "open":
-            send_message(
-                "ℹ️ SOURA MITRA WEBSITE UPDATE\n\n"
-                "Farmer Registration entry point is no longer visible.\nMonitoring continues."
+            unpin_message(state.get("pinned_message_id"))
+            state["pinned_message_id"] = None
+            send_photo(
+                RUNTIME.get("screenshot"),
+                "ℹ️ <b>SOURA MITRA WEBSITE UPDATE</b>\n\n"
+                "Farmer Registration entry point is no longer visible.\n"
+                f"🕒 {fmt_ist(now_dt())}\nMonitoring continues.",
             )
         if recovered:
-            send_message("🟢 SOURA MITRA MONITOR: website checks are working again.")
+            send_message(f"🟢 <b>SOURA MITRA MONITOR:</b> website checks are working again.\n🕒 {fmt_ist(now_dt())}")
     except Exception as e:  # noqa: BLE001
         log("alert failed:", e)
 
@@ -410,8 +677,9 @@ def main(argv=None):
             gap = (started - datetime.fromisoformat(last)).total_seconds()
             if gap > GAP_ALERT_SECONDS and not args.once:
                 send_message(
-                    f"⚠️ SOURA MITRA MONITOR: no check for {int(gap // 60)} min "
-                    "(GitHub did not restart the monitor in time). Back online now."
+                    f"⚠️ <b>SOURA MITRA MONITOR:</b> no check for {int(gap // 60)} min "
+                    "(GitHub did not restart the monitor in time). "
+                    f"Back online now.\n🕒 {fmt_ist(started)}"
                 )
     except Exception as e:  # noqa: BLE001
         log("gap notice failed:", e)

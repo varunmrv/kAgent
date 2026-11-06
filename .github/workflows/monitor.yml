@@ -27,6 +27,10 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       SITE_URL: ${{ secrets.SITE_URL }}   # website to watch; kept out of the public repo
+      # Optional, not secret: how the "registration open" alert addresses you. Set under
+      # Settings > Secrets and variables > Actions > Variables. Empty = uses your Telegram name.
+      MENTION_NAME: ${{ vars.MENTION_NAME }}
+      MENTION_USERNAME: ${{ vars.MENTION_USERNAME }}
       GH_TOKEN: ${{ github.token }}
       RUN_SECONDS: "19800"           # 5 h 30 min of monitoring per run
       CHECK_INTERVAL_SECONDS: "300"  # website check every 5 minutes
