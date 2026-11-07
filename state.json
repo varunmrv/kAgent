@@ -1,0 +1,12 @@
+{
+  "status": "closed",
+  "last_successful_check": "2026-11-07T12:47:30+00:00",
+  "last_check_result": "success",
+  "last_error": null,
+  "consecutive_failures": 0,
+  "telegram_update_offset": 10654906,
+  "alert_acked": false,
+  "alert_count": 0,
+  "last_alert_at": null,
+  "pinned_message_id": null
+}
